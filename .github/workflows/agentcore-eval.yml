@@ -1,0 +1,124 @@
+# .github/workflows/agentcore-eval.yml
+name: AgentCore Deploy & Evaluate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "scripts/**"
+      - ".github/workflows/agentcore-eval.yml"
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+  # Agent names must use underscores (not hyphens), start with a letter, 1-48 chars
+  AGENT_NAME: my_oauth_agent
+  ECR_REPO_NAME: my-oauth-agent
+  EVAL_THRESHOLD: "0.7"
+
+jobs:
+  deploy-and-evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 bedrock-agentcore bedrock-agentcore-starter-toolkit
+
+      - name: Get AWS Account ID
+        id: account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy agent to AgentCore Runtime
+        id: deploy
+        env:
+          AWS_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
+          AGENT_RUNTIME_ROLE_ARN: ${{ secrets.AGENT_RUNTIME_ROLE_ARN }}
+          COGNITO_DISCOVERY_URL: ${{ secrets.COGNITO_DISCOVERY_URL }}
+          COGNITO_CLIENT_ID: ${{ secrets.COGNITO_CLIENT_ID }}
+          COGNITO_AUDIENCE: ${{ secrets.COGNITO_AUDIENCE }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: python scripts/deploy_agent.py
+
+      - name: Invoke agent with test prompts
+        id: invoke
+        env:
+          AGENT_RUNTIME_ARN: ${{ steps.deploy.outputs.agent_runtime_arn }}
+          COGNITO_CLIENT_ID: ${{ secrets.COGNITO_CLIENT_ID }}
+          CI_TEST_USERNAME: ${{ secrets.CI_TEST_USERNAME }}
+          CI_TEST_PASSWORD: ${{ secrets.CI_TEST_PASSWORD }}
+        run: python scripts/invoke_agent_for_eval.py
+
+      - name: Evaluate agent quality
+        id: evaluate
+        env:
+          SESSION_IDS: ${{ steps.invoke.outputs.session_ids }}
+          EVAL_THRESHOLD: ${{ env.EVAL_THRESHOLD }}
+          AGENT_RUNTIME_ID: ${{ env.AGENT_NAME }}
+          EVALUATOR_IDS: "Builtin.Helpfulness,Builtin.Correctness,Builtin.GoalSuccessRate,Builtin.ToolSelectionAccuracy,Builtin.InstructionFollowing,Builtin.ResponseRelevance"
+        run: python scripts/evaluate_agent.py
+
+      - name: Upload evaluation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-results
+          path: evaluation_results.json
+
+      - name: Post evaluation summary to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## 🤖 AgentCore Evaluation Results\n\n';
+
+            try {
+              const results = JSON.parse(fs.readFileSync('evaluation_results.json', 'utf8'));
+              const threshold = parseFloat('${{ env.EVAL_THRESHOLD }}');
+
+              body += '| Evaluator | Score | Status |\n';
+              body += '|-----------|-------|--------|\n';
+
+              let allPassed = true;
+              for (const [evaluator, result] of Object.entries(results)) {
+                const passed = result.score >= threshold;
+                if (!passed) allPassed = false;
+                const status = passed ? '✅ Pass' : '❌ Fail';
+                body += `| ${evaluator} | ${result.score.toFixed(2)} | ${status} |\n`;
+              }
+
+              body += `\n**Threshold:** ${threshold}\n`;
+              body += allPassed
+                ? '\n✅ **Quality gate passed.**'
+                : '\n❌ **Quality gate failed.** Fix the issues above before merging.';
+            } catch (e) {
+              body += '⚠️ Could not load evaluation results.\n\n' + e.message;
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body,
+            });
