@@ -69,18 +69,21 @@ def deploy_agent():
 
     # Deploy: try to create, fall back to update if already exists
     agent_runtime_arn = None
+    agent_runtime_id = None
     try:
         print(f"Creating new runtime: {agent_name}")
         response = control_client.create_agent_runtime(**runtime_config)
         agent_runtime_arn = response["agentRuntimeArn"]
+        agent_runtime_id = response.get("agentRuntimeId")
     except control_client.exceptions.ConflictException:
         # Runtime already exists — find it and update
         print(f"Runtime '{agent_name}' already exists. Finding ARN...")
         try:
             runtimes = control_client.list_agent_runtimes()
-            for rt in runtimes.get("agentRuntimeSummaries", []):
+            for rt in runtimes.get("agentRuntimes", []):
                 if rt.get("agentRuntimeName") == agent_name:
                     agent_runtime_arn = rt["agentRuntimeArn"]
+                    agent_runtime_id = rt.get("agentRuntimeId")
                     break
         except Exception as e:
             print(f"Warning: Could not list runtimes: {e}")
@@ -88,7 +91,7 @@ def deploy_agent():
         if agent_runtime_arn:
             print(f"Updating existing runtime: {agent_runtime_arn}")
             control_client.update_agent_runtime(
-                agentRuntimeArn=agent_runtime_arn,
+                agentRuntimeId=agent_runtime_id,
                 agentRuntimeArtifact=runtime_config["agentRuntimeArtifact"],
             )
         else:
@@ -98,22 +101,22 @@ def deploy_agent():
     print(f"Agent Runtime ARN: {agent_runtime_arn}")
 
     # Wait for runtime to become active (no SDK waiter available)
-    print("Waiting for runtime to become ACTIVE...")
+    print(f"Waiting for runtime to become ACTIVE (id={agent_runtime_id})...")
     for _ in range(60):  # Up to 5 minutes
         try:
-            runtimes = control_client.list_agent_runtimes()
-            for rt in runtimes.get("agentRuntimeSummaries", []):
-                if rt.get("agentRuntimeArn") == agent_runtime_arn:
-                    status = rt.get("status", "")
-                    print(f"  Status: {status}")
-                    if status == "READY":
-                        print("Runtime is ACTIVE.")
-                        break
-            else:
-                time.sleep(5)
-                continue
-            break
-        except Exception:
+            rt = control_client.get_agent_runtime(agentRuntimeId=agent_runtime_id)
+            status = rt.get("status", "")
+            print(f"  Status: {status}")
+            if status == "READY":
+                print("Runtime is ACTIVE.")
+                break
+            elif status in ("CREATE_FAILED", "UPDATE_FAILED"):
+                reason = rt.get("failureReason", "unknown")
+                print(f"ERROR: Runtime failed with status {status}: {reason}")
+                sys.exit(1)
+            time.sleep(5)
+        except Exception as e:
+            print(f"  Polling error: {e}")
             time.sleep(5)
     else:
         print("Warning: Timed out waiting for runtime. Proceeding anyway.")
