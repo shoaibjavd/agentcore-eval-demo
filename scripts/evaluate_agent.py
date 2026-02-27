@@ -300,7 +300,6 @@ def main():
 
     if not session_ids:
         print("ERROR: No session IDs provided. Nothing to evaluate.")
-        # Write empty results so the PR comment step doesn't fail
         with open("evaluation_results.json", "w") as f:
             json.dump({"error": "No session IDs provided"}, f)
         sys.exit(1)
@@ -308,20 +307,21 @@ def main():
     print(f"Session IDs to evaluate: {session_ids}")
     print(f"Evaluators: {evaluator_ids}")
 
-    # Fetch traces (spans + log records from CloudWatch) — grouped by session
-    spans_by_session = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
+    # Fetch traces with retry — CloudWatch log ingestion can lag
+    spans_by_session = {}
+    for attempt in range(3):
+        spans_by_session = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
+        if len(spans_by_session) >= len(session_ids):
+            break
+        if attempt < 2:
+            wait = 30 * (attempt + 1)
+            print(f"\nOnly found {len(spans_by_session)}/{len(session_ids)} sessions. Waiting {wait}s for more traces...")
+            time.sleep(wait)
+
     if not spans_by_session:
-        print("WARNING: No traces found in CloudWatch.")
-        print("This can happen if:")
-        print("  1. CloudWatch Transaction Search is not enabled (one-time setup)")
-        print("  2. The agent doesn't have strands-agents[otel] installed")
-        print("  3. Traces haven't propagated yet (try increasing the wait time)")
-        print("  4. The aws-opentelemetry-distro package is not in requirements.txt")
-        print("")
-        print("To enable Transaction Search, run:")
-        print("  aws xray update-trace-segment-destination --destination CloudWatchLogs")
-        print("")
-        print("Skipping evaluation — writing diagnostic results.")
+        print("WARNING: No traces found in CloudWatch after retries.")
+        print("Possible causes: Transaction Search not enabled, strands-agents[otel] not installed,")
+        print("or aws-opentelemetry-distro not in requirements.txt.")
         diagnostic = {
             "error": "No traces found in CloudWatch",
             "session_ids": session_ids,
@@ -330,7 +330,6 @@ def main():
         }
         with open("evaluation_results.json", "w") as f:
             json.dump(diagnostic, f, indent=2)
-        # Exit with 0 so the PR comment step can report the diagnostic
         sys.exit(0)
 
     # Run evaluations (per-session, then averaged)
