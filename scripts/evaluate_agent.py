@@ -95,7 +95,7 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
 
     # Two log groups to query: spans (trace metadata) and agent logs (conversation content)
     log_groups = {
-        "aws/spans": "OTel spans",
+        "/aws/spans": "OTel spans",
         agent_log_group: "OTel log records",
     }
 

@@ -80,7 +80,7 @@ jobs:
         env:
           SESSION_IDS: ${{ steps.invoke.outputs.session_ids }}
           EVAL_THRESHOLD: ${{ env.EVAL_THRESHOLD }}
-          AGENT_RUNTIME_ID: ${{ env.AGENT_NAME }}
+          AGENT_RUNTIME_ID: ${{ steps.deploy.outputs.agent_runtime_id }}
           EVALUATOR_IDS: "Builtin.Helpfulness,Builtin.Correctness,Builtin.GoalSuccessRate,Builtin.ToolSelectionAccuracy,Builtin.InstructionFollowing,Builtin.ResponseRelevance"
         run: python scripts/evaluate_agent.py
 

@@ -133,8 +133,8 @@ def run_test_sessions():
         sys.exit(1)
 
     # Allow traces to flush to CloudWatch
-    print("\nWaiting 30s for traces to propagate to CloudWatch...")
-    time.sleep(30)
+    print("\nWaiting 60s for traces to propagate to CloudWatch...")
+    time.sleep(60)
 
     print(f"\nCompleted {len(session_ids)}/{len(test_cases)} test sessions.")
     return session_ids

@@ -129,8 +129,11 @@ def deploy_agent():
 
 if __name__ == "__main__":
     arn = deploy_agent()
-    # Write ARN to GitHub Actions output
+    # Write ARN and runtime ID to GitHub Actions output
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
+        # Extract runtime ID from ARN: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+        runtime_id = arn.rsplit("/", 1)[-1] if arn else ""
         with open(github_output, "a") as f:
             f.write(f"agent_runtime_arn={arn}\n")
+            f.write(f"agent_runtime_id={runtime_id}\n")
