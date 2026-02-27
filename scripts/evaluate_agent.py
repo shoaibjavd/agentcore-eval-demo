@@ -140,10 +140,11 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
             log_groups[g] = "Runtime structured logs"
             break
 
-    all_spans = []
+    spans_by_session = {}
 
     for session_id in session_ids:
         print(f"\nFetching traces for session: {session_id}")
+        session_spans = []
 
         for log_group, label in log_groups.items():
             print(f"  Querying {label} from {log_group}")
@@ -183,63 +184,77 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
                     if field["field"] == "@message":
                         try:
                             span = json.loads(field["value"])
-                            all_spans.append(span)
+                            session_spans.append(span)
                             count += 1
                         except json.JSONDecodeError:
                             continue
             print(f"  Found {count} records.")
 
-    print(f"Collected {len(all_spans)} total records across {len(session_ids)} sessions.")
-    return all_spans
+        if session_spans:
+            spans_by_session[session_id] = session_spans
+
+    total = sum(len(s) for s in spans_by_session.values())
+    print(f"\nCollected {total} total records across {len(spans_by_session)} sessions (of {len(session_ids)} requested).")
+    return spans_by_session
 
 
-def run_evaluation(spans, evaluator_ids, region):
+def run_evaluation(spans_by_session, evaluator_ids, region):
     """
     Run on-demand evaluation using the AgentCore Evaluate API.
+    Evaluates each session separately (API requires single-session input),
+    then averages scores across sessions.
     Returns a dict of evaluator_id -> {score, explanation}.
     """
     client = boto3.client("bedrock-agentcore", region_name=region)
-    results = {}
+    # Collect per-evaluator scores across all sessions
+    evaluator_scores = {eid: [] for eid in evaluator_ids}
 
-    for evaluator_id in evaluator_ids:
-        info = BUILTIN_EVALUATORS.get(evaluator_id, {})
-        print(f"\nEvaluating with: {evaluator_id}")
-        print(f"  ({info.get('description', 'Custom evaluator')})")
+    for session_id, session_spans in spans_by_session.items():
+        print(f"\n--- Evaluating session: {session_id} ({len(session_spans)} spans) ---")
 
-        try:
-            response = client.evaluate(
-                evaluatorId=evaluator_id,
-                evaluationInput={"sessionSpans": spans},
-            )
+        for evaluator_id in evaluator_ids:
+            info = BUILTIN_EVALUATORS.get(evaluator_id, {})
+            print(f"  {evaluator_id}: ", end="")
 
-            eval_results = response.get("evaluationResults", [])
-            if eval_results:
-                # Each result has: evaluatorId, value (double), explanation, label, etc.
-                result = eval_results[0]
-                score = result.get("value", 0) or 0
-                explanation = result.get("explanation", "No explanation")
-                error_msg = result.get("errorMessage", "")
+            try:
+                response = client.evaluate(
+                    evaluatorId=evaluator_id,
+                    evaluationInput={"sessionSpans": session_spans},
+                )
 
-                if error_msg:
-                    print(f"  Evaluator error: {error_msg}")
-                    results[evaluator_id] = {
-                        "score": 0,
-                        "explanation": error_msg,
-                    }
+                eval_results = response.get("evaluationResults", [])
+                if eval_results:
+                    result = eval_results[0]
+                    score = result.get("value", 0) or 0
+                    error_msg = result.get("errorMessage", "")
+
+                    if error_msg:
+                        print(f"error — {error_msg[:100]}")
+                    else:
+                        evaluator_scores[evaluator_id].append(score)
+                        print(f"{score:.2f}")
                 else:
-                    results[evaluator_id] = {
-                        "score": score,
-                        "explanation": explanation,
-                    }
-                    print(f"  Score: {score:.2f}")
-                    print(f"  Explanation: {explanation[:150]}...")
-            else:
-                print(f"  No results returned.")
-                results[evaluator_id] = {"score": 0, "explanation": "No results"}
+                    print("no results")
 
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            results[evaluator_id] = {"score": 0, "explanation": str(e)}
+            except Exception as e:
+                print(f"error — {e}")
+
+    # Average scores across sessions
+    results = {}
+    for evaluator_id in evaluator_ids:
+        scores = evaluator_scores[evaluator_id]
+        if scores:
+            avg = sum(scores) / len(scores)
+            results[evaluator_id] = {
+                "score": avg,
+                "explanation": f"Average of {len(scores)} session(s)",
+                "session_scores": scores,
+            }
+        else:
+            results[evaluator_id] = {
+                "score": 0,
+                "explanation": "No successful evaluations",
+            }
 
     return results
 
@@ -293,9 +308,9 @@ def main():
     print(f"Session IDs to evaluate: {session_ids}")
     print(f"Evaluators: {evaluator_ids}")
 
-    # Fetch traces (spans + log records from CloudWatch)
-    spans = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
-    if not spans:
+    # Fetch traces (spans + log records from CloudWatch) — grouped by session
+    spans_by_session = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
+    if not spans_by_session:
         print("WARNING: No traces found in CloudWatch.")
         print("This can happen if:")
         print("  1. CloudWatch Transaction Search is not enabled (one-time setup)")
@@ -318,8 +333,8 @@ def main():
         # Exit with 0 so the PR comment step can report the diagnostic
         sys.exit(0)
 
-    # Run evaluations
-    results = run_evaluation(spans, evaluator_ids, region)
+    # Run evaluations (per-session, then averaged)
+    results = run_evaluation(spans_by_session, evaluator_ids, region)
 
     # Write results to JSON for GitHub Actions artifact upload and PR comment
     with open("evaluation_results.json", "w") as f:
