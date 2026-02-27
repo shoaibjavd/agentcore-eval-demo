@@ -91,15 +91,15 @@ def run_test_sessions():
     # Define test prompts — customize these for your agent
     test_cases = [
         {
-            "prompt": "What meetings do I have tomorrow?",
-            "description": "Calendar query — tests MCP tool selection",
+            "prompt": "What are three best practices for writing clean Python code?",
+            "description": "Knowledge query — tests helpfulness and correctness",
         },
         {
-            "prompt": "Summarize the key action items from my last team standup.",
-            "description": "Multi-step reasoning — tests coherence and helpfulness",
+            "prompt": "Explain the difference between a list and a tuple in Python.",
+            "description": "Explanation — tests coherence and response relevance",
         },
         {
-            "prompt": "Draft a follow-up email to the client about the Q3 deliverables.",
+            "prompt": "Write a short greeting message for a new team member named Alex.",
             "description": "Content generation — tests instruction following",
         },
     ]
