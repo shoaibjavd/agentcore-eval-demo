@@ -3,6 +3,7 @@ import boto3
 import subprocess
 import sys
 import os
+import time
 
 def deploy_agent():
     region = os.environ["AWS_REGION"]
@@ -91,11 +92,26 @@ def deploy_agent():
 
     print(f"Agent Runtime ARN: {agent_runtime_arn}")
 
-    # Wait for runtime to become active
-    waiter = control_client.get_waiter("agent_runtime_active")
+    # Wait for runtime to become active (no SDK waiter available)
     print("Waiting for runtime to become ACTIVE...")
-    waiter.wait(agentRuntimeArn=agent_runtime_arn)
-    print("Runtime is ACTIVE.")
+    for _ in range(60):  # Up to 5 minutes
+        try:
+            runtimes = control_client.list_agent_runtimes()
+            for rt in runtimes.get("agentRuntimeSummaries", []):
+                if rt.get("agentRuntimeArn") == agent_runtime_arn:
+                    status = rt.get("status", "")
+                    print(f"  Status: {status}")
+                    if status == "READY":
+                        print("Runtime is ACTIVE.")
+                        break
+            else:
+                time.sleep(5)
+                continue
+            break
+        except Exception:
+            time.sleep(5)
+    else:
+        print("Warning: Timed out waiting for runtime. Proceeding anyway.")
 
     return agent_runtime_arn
 
