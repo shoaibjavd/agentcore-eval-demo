@@ -26,8 +26,15 @@ def deploy_agent():
         shell=True, check=True,
     )
 
-    # Build and push
-    subprocess.run(["docker", "build", "-t", full_image_uri, "agent/"], check=True)
+    # Build ARM64 image (required by AgentCore Runtime)
+    # Use buildx for cross-platform build on x86_64 CI runners
+    subprocess.run([
+        "docker", "buildx", "build",
+        "--platform", "linux/arm64",
+        "-t", full_image_uri,
+        "--load",
+        "agent/"
+    ], check=True)
     subprocess.run(["docker", "push", full_image_uri], check=True)
     print(f"Pushed image: {full_image_uri}")
 
