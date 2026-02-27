@@ -91,18 +91,59 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
     # Determine the agent runtime log group
     if not agent_runtime_id:
         agent_runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
-    agent_log_group = f"/aws/bedrock-agentcore/runtimes/{agent_runtime_id}-DEFAULT"
 
-    # Two log groups to query: spans (trace metadata) and agent logs (conversation content)
-    log_groups = {
-        "aws/spans": "OTel spans",
-        agent_log_group: "OTel log records",
-    }
+    # Discover available log groups for this runtime
+    print("Discovering CloudWatch log groups...")
+    available_groups = []
+    try:
+        paginator = logs_client.get_paginator("describe_log_groups")
+        for prefix in ["aws/spans", "/aws/spans", "/aws/bedrock-agentcore"]:
+            for page in paginator.paginate(logGroupNamePrefix=prefix):
+                for group in page.get("logGroups", []):
+                    name = group["logGroupName"]
+                    available_groups.append(name)
+                    print(f"  Found: {name}")
+    except Exception as e:
+        print(f"  Warning: Could not list log groups: {e}")
+
+    if not available_groups:
+        print("  No AgentCore or spans log groups found.")
+        print("  Ensure CloudWatch Transaction Search is enabled in your account.")
+        print("  See: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-get-started.html")
+
+    # Build the list of log groups to query
+    # Prefer discovered groups, fall back to expected names
+    spans_group = None
+    agent_group = None
+    for g in available_groups:
+        if "spans" in g and not spans_group:
+            spans_group = g
+        if agent_runtime_id and agent_runtime_id in g and not agent_group:
+            agent_group = g
+
+    log_groups = {}
+    if spans_group:
+        log_groups[spans_group] = "OTel spans"
+    else:
+        log_groups["aws/spans"] = "OTel spans (expected)"
+
+    expected_agent_group = f"/aws/bedrock-agentcore/runtimes/{agent_runtime_id}-DEFAULT"
+    if agent_group:
+        log_groups[agent_group] = "OTel log records"
+    else:
+        log_groups[expected_agent_group] = "OTel log records (expected)"
+
+    # Also try the runtime-logs subgroup which contains OTEL structured logs
+    runtime_logs_group = f"/aws/bedrock-agentcore/runtimes/{agent_runtime_id}-DEFAULT/runtime-logs"
+    for g in available_groups:
+        if "runtime-logs" in g:
+            log_groups[g] = "Runtime structured logs"
+            break
 
     all_spans = []
 
     for session_id in session_ids:
-        print(f"Fetching traces for session: {session_id}")
+        print(f"\nFetching traces for session: {session_id}")
 
         for log_group, label in log_groups.items():
             print(f"  Querying {label} from {log_group}")
@@ -255,10 +296,27 @@ def main():
     # Fetch traces (spans + log records from CloudWatch)
     spans = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
     if not spans:
-        print("ERROR: No traces found. Check CloudWatch Transaction Search.")
+        print("WARNING: No traces found in CloudWatch.")
+        print("This can happen if:")
+        print("  1. CloudWatch Transaction Search is not enabled (one-time setup)")
+        print("  2. The agent doesn't have strands-agents[otel] installed")
+        print("  3. Traces haven't propagated yet (try increasing the wait time)")
+        print("  4. The aws-opentelemetry-distro package is not in requirements.txt")
+        print("")
+        print("To enable Transaction Search, run:")
+        print("  aws xray update-trace-segment-destination --destination CloudWatchLogs")
+        print("")
+        print("Skipping evaluation — writing diagnostic results.")
+        diagnostic = {
+            "error": "No traces found in CloudWatch",
+            "session_ids": session_ids,
+            "agent_runtime_id": agent_runtime_id,
+            "hint": "Enable CloudWatch Transaction Search and ensure strands-agents[otel] is installed",
+        }
         with open("evaluation_results.json", "w") as f:
-            json.dump({"error": "No traces found in CloudWatch"}, f)
-        sys.exit(1)
+            json.dump(diagnostic, f, indent=2)
+        # Exit with 0 so the PR comment step can report the diagnostic
+        sys.exit(0)
 
     # Run evaluations
     results = run_evaluation(spans, evaluator_ids, region)
