@@ -67,28 +67,33 @@ def deploy_agent():
             }
         }
 
-    # Check if runtime already exists by listing and filtering by name
+    # Deploy: try to create, fall back to update if already exists
     agent_runtime_arn = None
     try:
-        runtimes = control_client.list_agent_runtimes()
-        for rt in runtimes.get("agentRuntimeSummaries", []):
-            if rt.get("agentRuntimeName") == agent_name:
-                agent_runtime_arn = rt["agentRuntimeArn"]
-                print(f"Found existing runtime: {agent_runtime_arn}")
-                break
-    except Exception as e:
-        print(f"Warning: Could not list runtimes: {e}")
-
-    if agent_runtime_arn:
-        print(f"Updating existing runtime: {agent_runtime_arn}")
-        control_client.update_agent_runtime(
-            agentRuntimeArn=agent_runtime_arn,
-            agentRuntimeArtifact=runtime_config["agentRuntimeArtifact"],
-        )
-    else:
         print(f"Creating new runtime: {agent_name}")
         response = control_client.create_agent_runtime(**runtime_config)
         agent_runtime_arn = response["agentRuntimeArn"]
+    except control_client.exceptions.ConflictException:
+        # Runtime already exists — find it and update
+        print(f"Runtime '{agent_name}' already exists. Finding ARN...")
+        try:
+            runtimes = control_client.list_agent_runtimes()
+            for rt in runtimes.get("agentRuntimeSummaries", []):
+                if rt.get("agentRuntimeName") == agent_name:
+                    agent_runtime_arn = rt["agentRuntimeArn"]
+                    break
+        except Exception as e:
+            print(f"Warning: Could not list runtimes: {e}")
+
+        if agent_runtime_arn:
+            print(f"Updating existing runtime: {agent_runtime_arn}")
+            control_client.update_agent_runtime(
+                agentRuntimeArn=agent_runtime_arn,
+                agentRuntimeArtifact=runtime_config["agentRuntimeArtifact"],
+            )
+        else:
+            print("ERROR: Runtime exists but could not find ARN. Exiting.")
+            sys.exit(1)
 
     print(f"Agent Runtime ARN: {agent_runtime_arn}")
 
