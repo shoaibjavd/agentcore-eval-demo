@@ -1,4 +1,17 @@
 # scripts/evaluate_agent.py
+"""
+Evaluate agent quality using the AgentCore Evaluate API (quality gate).
+
+This is the core of the CI/CD pipeline. It:
+1. Fetches OTel traces from CloudWatch (spans + log records)
+2. Runs each session through the Evaluate API with selected evaluators
+3. Averages scores across sessions
+4. Enforces a quality gate — exits non-zero if any evaluator falls below threshold
+
+The Evaluate API requires single-session input. You cannot send spans from
+multiple sessions in one evaluate() call — it returns ValidationException.
+This script evaluates each session separately and averages the scores.
+"""
 import boto3
 import json
 import os
@@ -78,12 +91,49 @@ DEFAULT_CI_EVALUATORS = [
 ]
 
 
+def load_demo_traces(demo_file):
+    """Load bundled trace fixtures for demo mode (no AWS credentials needed).
+
+    Args:
+        demo_file: Path to the JSON file containing sample sessionSpans.
+
+    Returns:
+        dict: session_id -> list[spans], same format as fetch_traces_from_cloudwatch.
+    """
+    print(f"DEMO MODE: Loading traces from {demo_file}")
+    if not os.path.exists(demo_file):
+        print(f"ERROR: Demo traces file not found: {demo_file}")
+        print("Create it by running the agent in staging and exporting spans.")
+        sys.exit(1)
+
+    with open(demo_file) as f:
+        data = json.load(f)
+
+    # Support two formats: {session_id: [spans]} dict, or flat [spans] list
+    if isinstance(data, dict):
+        spans_by_session = data
+    elif isinstance(data, list):
+        # Group spans by session.id attribute
+        spans_by_session = {}
+        for span in data:
+            sid = span.get("attributes", {}).get("session.id", "demo-session")
+            spans_by_session.setdefault(sid, []).append(span)
+    else:
+        print(f"ERROR: Unexpected format in {demo_file}")
+        sys.exit(1)
+
+    total = sum(len(s) for s in spans_by_session.values())
+    print(f"Loaded {total} spans across {len(spans_by_session)} sessions from fixture.")
+    return spans_by_session
+
+
 def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
     """
     Fetch OpenTelemetry spans AND log records from CloudWatch
     for the given session IDs.
 
     The Evaluate API requires OTel spans with gen_ai attributes.
+    Returns a dict of session_id -> list[spans] for per-session evaluation.
     """
     logs_client = boto3.client("logs", region_name=region)
 
@@ -91,12 +141,20 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
     if not agent_runtime_id:
         agent_runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
 
-    # Discover available log groups for this runtime
+    # --- Discover available log groups ---
+    # AgentCore traces live in two log groups:
+    #   1. "aws/spans" — OTel trace spans (metadata, attributes, timestamps)
+    #   2. "/aws/bedrock-agentcore/runtimes/{id}-DEFAULT" — OTel log records (conversation content)
+    # We discover them dynamically because the runtime ID includes a random suffix.
     print("Discovering CloudWatch log groups...")
     available_groups = []
     try:
         paginator = logs_client.get_paginator("describe_log_groups")
-        for prefix in ["aws/spans", "/aws/spans", "/aws/bedrock-agentcore"]:
+        # Only two prefixes needed:
+        # - "aws/spans" for OTel trace spans (no leading slash per AWS docs)
+        # - "/aws/bedrock-agentcore" for agent log records (events with conversation content)
+        # Note: "/aws/spans" (with leading slash) is NOT a valid log group — don't search for it
+        for prefix in ["aws/spans", "/aws/bedrock-agentcore"]:
             for page in paginator.paginate(logGroupNamePrefix=prefix):
                 for group in page.get("logGroups", []):
                     name = group["logGroupName"]
@@ -110,13 +168,17 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
         print("  Ensure CloudWatch Transaction Search is enabled in your account.")
         print("  See: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-get-started.html")
 
-    # Build the list of log groups to query
-    # Prefer discovered groups, fall back to expected names
+    # --- Build the list of log groups to query ---
+    # Match discovered groups to their roles. If discovery found nothing
+    # (e.g., permissions issue), fall back to the expected names so the
+    # query still attempts and gives a clear "not found" error.
     spans_group = None
     agent_group = None
     for g in available_groups:
+        # The spans log group is "aws/spans" (no leading slash)
         if "spans" in g and not spans_group:
             spans_group = g
+        # The agent log group contains the runtime ID (with random suffix)
         if agent_runtime_id and agent_runtime_id in g and not agent_group:
             agent_group = g
 
@@ -147,6 +209,9 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
 
         for log_group, label in log_groups.items():
             print(f"  Querying {label} from {log_group}")
+            # Use CloudWatch Logs Insights to filter by session ID.
+            # The session ID appears in the @message JSON, so we use a
+            # string-match filter rather than a structured attribute query.
             query = f"""
                 fields @timestamp, @message
                 | filter @message like /"{session_id}"/
@@ -155,9 +220,10 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
             """
 
             try:
+                # CloudWatch Logs Insights queries are async — start, then poll
                 response = logs_client.start_query(
                     logGroupName=log_group,
-                    startTime=int((time.time() - 7200) * 1000),  # Look back 2 hours
+                    startTime=int((time.time() - 7200) * 1000),  # 2-hour lookback window
                     endTime=int(time.time() * 1000),
                     queryString=query,
                 )
@@ -202,7 +268,7 @@ def run_evaluation(spans_by_session, evaluator_ids, region):
     Run on-demand evaluation using the AgentCore Evaluate API.
     Evaluates each session separately (API requires single-session input),
     then averages scores across sessions.
-    Returns a dict of evaluator_id -> {score, explanation}.
+    Returns a dict of evaluator_id -> {score, explanation, session_scores}.
     """
     client = boto3.client("bedrock-agentcore", region_name=region)
     # Collect per-evaluator scores across all sessions
@@ -216,6 +282,8 @@ def run_evaluation(spans_by_session, evaluator_ids, region):
             print(f"  {evaluator_id}: ", end="")
 
             try:
+                # Each evaluate() call must contain spans from ONE session only.
+                # Mixing sessions causes ValidationException.
                 response = client.evaluate(
                     evaluatorId=evaluator_id,
                     evaluationInput={"sessionSpans": session_spans},
@@ -224,6 +292,7 @@ def run_evaluation(spans_by_session, evaluator_ids, region):
                 eval_results = response.get("evaluationResults", [])
                 if eval_results:
                     result = eval_results[0]
+                    # Score is in "value", NOT "score" — using "score" silently returns 0
                     score = result.get("value", 0) or 0
                     error_msg = result.get("errorMessage", "")
 
@@ -259,7 +328,12 @@ def run_evaluation(spans_by_session, evaluator_ids, region):
 
 
 def enforce_quality_gate(results, threshold):
-    """Check if all evaluation scores meet the threshold."""
+    """Check if all evaluation scores meet the threshold.
+
+    Prints a formatted report and returns whether the gate passed.
+    This is the final decision point — if any evaluator is below
+    threshold, the CI pipeline should exit non-zero to block the PR.
+    """
     print(f"\n{'='*60}")
     print(f"QUALITY GATE — Threshold: {threshold}")
     print(f"{'='*60}")
@@ -283,53 +357,67 @@ def enforce_quality_gate(results, threshold):
 
 
 def main():
+    """Orchestrate the full evaluation pipeline: fetch → evaluate → gate."""
+    # --- Parse configuration from environment ---
     region = os.environ.get("AWS_REGION", "us-east-1")
-    session_ids_raw = os.environ.get("SESSION_IDS", "[]")
     threshold = float(os.environ.get("EVAL_THRESHOLD", "0.7"))
     evaluator_ids = os.environ.get(
         "EVALUATOR_IDS", ",".join(DEFAULT_CI_EVALUATORS)
     ).split(",")
-    agent_runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
 
-    # Parse session IDs — handle both JSON array and comma-separated formats
-    try:
-        session_ids = json.loads(session_ids_raw)
-    except json.JSONDecodeError:
-        session_ids = [s.strip() for s in session_ids_raw.split(",") if s.strip()]
+    # --- Demo mode: load bundled fixtures instead of querying AWS ---
+    # Set USE_DEMO_MODE=true to run locally without credentials.
+    use_demo = os.environ.get("USE_DEMO_MODE", "false").lower() in ("true", "1", "yes")
+    demo_file = os.environ.get("DEMO_TRACES_FILE", "fixtures/sample_traces.json")
 
-    if not session_ids:
-        print("ERROR: No session IDs provided. Nothing to evaluate.")
-        with open("evaluation_results.json", "w") as f:
-            json.dump({"error": "No session IDs provided"}, f)
-        sys.exit(1)
+    if use_demo:
+        spans_by_session = load_demo_traces(demo_file)
+    else:
+        # --- Live mode: fetch traces from CloudWatch ---
+        session_ids_raw = os.environ.get("SESSION_IDS", "[]")
+        agent_runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
 
-    print(f"Session IDs to evaluate: {session_ids}")
-    print(f"Evaluators: {evaluator_ids}")
+        # Parse session IDs — handle both JSON array and comma-separated formats
+        try:
+            session_ids = json.loads(session_ids_raw)
+        except json.JSONDecodeError:
+            session_ids = [s.strip() for s in session_ids_raw.split(",") if s.strip()]
 
-    # Fetch traces with retry — CloudWatch log ingestion can lag
-    spans_by_session = {}
-    for attempt in range(3):
-        spans_by_session = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
-        if len(spans_by_session) >= len(session_ids):
-            break
-        if attempt < 2:
-            wait = 30 * (attempt + 1)
-            print(f"\nOnly found {len(spans_by_session)}/{len(session_ids)} sessions. Waiting {wait}s for more traces...")
-            time.sleep(wait)
+        if not session_ids:
+            print("ERROR: No session IDs provided. Nothing to evaluate.")
+            with open("evaluation_results.json", "w") as f:
+                json.dump({"error": "No session IDs provided"}, f)
+            sys.exit(1)
 
-    if not spans_by_session:
-        print("WARNING: No traces found in CloudWatch after retries.")
-        print("Possible causes: Transaction Search not enabled, strands-agents[otel] not installed,")
-        print("or aws-opentelemetry-distro not in requirements.txt.")
-        diagnostic = {
-            "error": "No traces found in CloudWatch",
-            "session_ids": session_ids,
-            "agent_runtime_id": agent_runtime_id,
-            "hint": "Enable CloudWatch Transaction Search and ensure strands-agents[otel] is installed",
-        }
-        with open("evaluation_results.json", "w") as f:
-            json.dump(diagnostic, f, indent=2)
-        sys.exit(0)
+        print(f"Session IDs to evaluate: {session_ids}")
+        print(f"Evaluators: {evaluator_ids}")
+
+        # --- Fetch traces with retry ---
+        # CloudWatch log ingestion can lag behind agent invocation by 60-90s.
+        # Retry up to 3 times with increasing backoff to handle propagation delay.
+        spans_by_session = {}
+        for attempt in range(3):
+            spans_by_session = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
+            if len(spans_by_session) >= len(session_ids):
+                break
+            if attempt < 2:
+                wait = 30 * (attempt + 1)
+                print(f"\nOnly found {len(spans_by_session)}/{len(session_ids)} sessions. Waiting {wait}s for more traces...")
+                time.sleep(wait)
+
+        if not spans_by_session:
+            print("WARNING: No traces found in CloudWatch after retries.")
+            print("Possible causes: Transaction Search not enabled, strands-agents[otel] not installed,")
+            print("or aws-opentelemetry-distro not in requirements.txt.")
+            diagnostic = {
+                "error": "No traces found in CloudWatch",
+                "session_ids": session_ids,
+                "agent_runtime_id": agent_runtime_id,
+                "hint": "Enable CloudWatch Transaction Search and ensure strands-agents[otel] is installed",
+            }
+            with open("evaluation_results.json", "w") as f:
+                json.dump(diagnostic, f, indent=2)
+            sys.exit(0)
 
     # Run evaluations (per-session, then averaged)
     results = run_evaluation(spans_by_session, evaluator_ids, region)
