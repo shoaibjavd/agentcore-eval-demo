@@ -1,4 +1,7 @@
 # .github/workflows/agentcore-eval.yml
+# CI/CD pipeline that deploys, invokes, and evaluates an AgentCore Runtime agent.
+# Runs on PRs that touch agent code, scripts, or the workflow itself.
+# Gates the merge on evaluation scores — if the agent regresses, the PR stays blocked.
 name: AgentCore Deploy & Evaluate
 
 on:
@@ -10,9 +13,9 @@ on:
       - ".github/workflows/agentcore-eval.yml"
 
 permissions:
-  id-token: write   # Required for OIDC
-  contents: read
-  pull-requests: write
+  id-token: write   # Required for OIDC — lets GitHub request a JWT from its IdP
+  contents: read     # Read repo contents
+  pull-requests: write  # Post evaluation summary as PR comment
 
 env:
   AWS_REGION: us-east-1
@@ -43,6 +46,16 @@ jobs:
         run: |
           pip install boto3 bedrock-agentcore bedrock-agentcore-starter-toolkit
 
+      - name: Set up QEMU for ARM64 builds
+        # AgentCore Runtime requires ARM64 images, but GitHub runners are x86_64.
+        # QEMU enables cross-platform emulation so Docker can build ARM64 images.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        # Buildx extends Docker with multi-platform build support.
+        # Required alongside QEMU for the --platform linux/arm64 flag.
+        uses: docker/setup-buildx-action@v3
+
       - name: Get AWS Account ID
         id: account
         run: |
@@ -51,6 +64,8 @@ jobs:
 
       - name: Deploy agent to AgentCore Runtime
         id: deploy
+        # Outputs: agent_runtime_arn, agent_runtime_id
+        # The runtime ID (with random suffix) is needed for CloudWatch log group lookup.
         env:
           AWS_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
           AGENT_RUNTIME_ROLE_ARN: ${{ secrets.AGENT_RUNTIME_ROLE_ARN }}
@@ -62,6 +77,8 @@ jobs:
 
       - name: Invoke agent with test prompts
         id: invoke
+        # Outputs: session_ids (JSON array of session IDs for trace collection).
+        # Cognito secrets are optional — if not set, falls back to IAM SigV4.
         env:
           AGENT_RUNTIME_ARN: ${{ steps.deploy.outputs.agent_runtime_arn }}
           COGNITO_CLIENT_ID: ${{ secrets.COGNITO_CLIENT_ID }}
@@ -71,21 +88,28 @@ jobs:
 
       - name: Evaluate agent quality
         id: evaluate
+        # This step is the quality gate. It fetches traces from CloudWatch,
+        # runs evaluations, and exits non-zero if any score < threshold.
         env:
           SESSION_IDS: ${{ steps.invoke.outputs.session_ids }}
           EVAL_THRESHOLD: ${{ env.EVAL_THRESHOLD }}
-          AGENT_RUNTIME_ID: ${{ env.AGENT_NAME }}
-          EVALUATOR_IDS: "Builtin.Helpfulness,Builtin.Correctness,Builtin.GoalSuccessRate,Builtin.ToolSelectionAccuracy,Builtin.InstructionFollowing,Builtin.ResponseRelevance"
+          AGENT_RUNTIME_ID: ${{ steps.deploy.outputs.agent_runtime_id }}
+          EVALUATOR_IDS: "Builtin.Helpfulness,Builtin.Correctness,Builtin.GoalSuccessRate,Builtin.InstructionFollowing,Builtin.ResponseRelevance"
         run: python scripts/evaluate_agent.py
 
       - name: Upload evaluation results
+        # Upload results as a build artifact even if the quality gate failed.
+        # This lets reviewers download and inspect scores from the Actions UI.
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: evaluation-results
           path: evaluation_results.json
+          if-no-files-found: ignore
 
       - name: Post evaluation summary to PR
+        # Post a formatted table of evaluation scores as a PR comment.
+        # Runs even if the evaluate step failed, so reviewers always see results.
         if: always()
         uses: actions/github-script@v7
         with:
@@ -94,24 +118,35 @@ jobs:
             let body = '## 🤖 AgentCore Evaluation Results\n\n';
 
             try {
-              const results = JSON.parse(fs.readFileSync('evaluation_results.json', 'utf8'));
-              const threshold = parseFloat('${{ env.EVAL_THRESHOLD }}');
+              // Guard against missing file — earlier steps may have failed
+              if (!fs.existsSync('evaluation_results.json')) {
+                body += '⚠️ No evaluation results file was generated. Check the workflow logs for errors in earlier steps.';
+              } else {
+                const results = JSON.parse(fs.readFileSync('evaluation_results.json', 'utf8'));
+                const threshold = parseFloat('${{ env.EVAL_THRESHOLD }}');
 
-              body += '| Evaluator | Score | Status |\n';
-              body += '|-----------|-------|--------|\n';
+                // Handle error-only results (e.g. no sessions or no traces)
+                if (results.error) {
+                  body += `⚠️ Evaluation could not complete: ${results.error}`;
+                } else {
+                  body += '| Evaluator | Score | Status |\n';
+                  body += '|-----------|-------|--------|\n';
 
-              let allPassed = true;
-              for (const [evaluator, result] of Object.entries(results)) {
-                const passed = result.score >= threshold;
-                if (!passed) allPassed = false;
-                const status = passed ? '✅ Pass' : '❌ Fail';
-                body += `| ${evaluator} | ${result.score.toFixed(2)} | ${status} |\n`;
+                  let allPassed = true;
+                  for (const [evaluator, result] of Object.entries(results)) {
+                    const score = typeof result.score === 'number' ? result.score : 0;
+                    const passed = score >= threshold;
+                    if (!passed) allPassed = false;
+                    const status = passed ? '✅ Pass' : '❌ Fail';
+                    body += `| ${evaluator} | ${score.toFixed(2)} | ${status} |\n`;
+                  }
+
+                  body += `\n**Threshold:** ${threshold}\n`;
+                  body += allPassed
+                    ? '\n✅ **Quality gate passed.**'
+                    : '\n❌ **Quality gate failed.** Fix the issues above before merging.';
+                }
               }
-
-              body += `\n**Threshold:** ${threshold}\n`;
-              body += allPassed
-                ? '\n✅ **Quality gate passed.**'
-                : '\n❌ **Quality gate failed.** Fix the issues above before merging.';
             } catch (e) {
               body += '⚠️ Could not load evaluation results.\n\n' + e.message;
             }

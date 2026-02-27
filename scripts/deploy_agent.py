@@ -3,6 +3,8 @@ import boto3
 import subprocess
 import sys
 import os
+import time
+
 
 def deploy_agent():
     region = os.environ["AWS_REGION"]
@@ -26,8 +28,15 @@ def deploy_agent():
         shell=True, check=True,
     )
 
-    # Build and push
-    subprocess.run(["docker", "build", "-t", full_image_uri, "."], check=True)
+    # Build ARM64 image (required by AgentCore Runtime)
+    # Use buildx for cross-platform build on x86_64 CI runners
+    subprocess.run([
+        "docker", "buildx", "build",
+        "--platform", "linux/arm64",
+        "-t", full_image_uri,
+        "--load",
+        "agent/"
+    ], check=True)
     subprocess.run(["docker", "push", full_image_uri], check=True)
     print(f"Pushed image: {full_image_uri}")
 
@@ -52,43 +61,79 @@ def deploy_agent():
 
     if cognito_discovery_url:
         runtime_config["authorizerConfiguration"] = {
-            "customJWTAuthorizerConfiguration": {
+            "customJWTAuthorizer": {
                 "discoveryUrl": cognito_discovery_url,
-                "allowedAudiences": [cognito_audience] if cognito_audience else [],
+                "allowedAudience": [cognito_audience] if cognito_audience else [],
                 "allowedClients": [cognito_client_id] if cognito_client_id else [],
             }
         }
 
-    # Check if runtime already exists
+    # Deploy: try to create, fall back to update if already exists
+    agent_runtime_arn = None
+    agent_runtime_id = None
     try:
-        existing = control_client.get_agent_runtime(agentRuntimeName=agent_name)
-        agent_runtime_arn = existing["agentRuntimeArn"]
-        print(f"Updating existing runtime: {agent_runtime_arn}")
-
-        control_client.update_agent_runtime(
-            agentRuntimeArn=agent_runtime_arn,
-            agentRuntimeArtifact=runtime_config["agentRuntimeArtifact"],
-        )
-    except control_client.exceptions.ResourceNotFoundException:
         print(f"Creating new runtime: {agent_name}")
         response = control_client.create_agent_runtime(**runtime_config)
         agent_runtime_arn = response["agentRuntimeArn"]
+        agent_runtime_id = response.get("agentRuntimeId")
+    except control_client.exceptions.ConflictException:
+        # Runtime already exists — find it and update
+        print(f"Runtime '{agent_name}' already exists. Finding ARN...")
+        try:
+            runtimes = control_client.list_agent_runtimes()
+            for rt in runtimes.get("agentRuntimes", []):
+                if rt.get("agentRuntimeName") == agent_name:
+                    agent_runtime_arn = rt["agentRuntimeArn"]
+                    agent_runtime_id = rt.get("agentRuntimeId")
+                    break
+        except Exception as e:
+            print(f"Warning: Could not list runtimes: {e}")
+
+        if agent_runtime_arn and agent_runtime_id:
+            print(f"Updating existing runtime: {agent_runtime_arn}")
+            control_client.update_agent_runtime(
+                agentRuntimeId=agent_runtime_id,
+                agentRuntimeArtifact=runtime_config["agentRuntimeArtifact"],
+                roleArn=runtime_role_arn,
+                networkConfiguration=runtime_config["networkConfiguration"],
+            )
+        else:
+            print("ERROR: Runtime exists but could not find ARN/ID. Exiting.")
+            sys.exit(1)
 
     print(f"Agent Runtime ARN: {agent_runtime_arn}")
 
-    # Wait for runtime to become active
-    waiter = control_client.get_waiter("agent_runtime_active")
-    print("Waiting for runtime to become ACTIVE...")
-    waiter.wait(agentRuntimeArn=agent_runtime_arn)
-    print("Runtime is ACTIVE.")
+    # Wait for runtime to become READY
+    print(f"Waiting for runtime to become READY (id={agent_runtime_id})...")
+    for _ in range(60):  # Up to 5 minutes
+        try:
+            rt = control_client.get_agent_runtime(agentRuntimeId=agent_runtime_id)
+            status = rt.get("status", "")
+            print(f"  Status: {status}")
+            if status == "READY":
+                print("Runtime is READY.")
+                break
+            elif status in ("CREATE_FAILED", "UPDATE_FAILED"):
+                reason = rt.get("statusReasons", [{}])
+                print(f"ERROR: Runtime failed with status {status}: {reason}")
+                sys.exit(1)
+            time.sleep(5)
+        except Exception as e:
+            print(f"  Polling error: {e}")
+            time.sleep(5)
+    else:
+        print("Warning: Timed out waiting for runtime. Proceeding anyway.")
 
     return agent_runtime_arn
 
 
 if __name__ == "__main__":
     arn = deploy_agent()
-    # Write ARN to GitHub Actions output
+    # Write ARN and runtime ID to GitHub Actions output
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
+        # Extract runtime ID from ARN: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+        runtime_id = arn.rsplit("/", 1)[-1] if arn else ""
         with open(github_output, "a") as f:
             f.write(f"agent_runtime_arn={arn}\n")
+            f.write(f"agent_runtime_id={runtime_id}\n")
