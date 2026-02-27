@@ -95,7 +95,7 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
 
     # Two log groups to query: spans (trace metadata) and agent logs (conversation content)
     log_groups = {
-        "/aws/spans": "OTel spans",
+        "aws/spans": "OTel spans",
         agent_log_group: "OTel log records",
     }
 
@@ -110,13 +110,13 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
                 fields @timestamp, @message
                 | filter @message like /"{session_id}"/
                 | sort @timestamp asc
-                | limit 100
+                | limit 200
             """
 
             try:
                 response = logs_client.start_query(
                     logGroupName=log_group,
-                    startTime=int((time.time() - 3600) * 1000),  # Look back 1 hour
+                    startTime=int((time.time() - 7200) * 1000),  # Look back 2 hours
                     endTime=int(time.time() * 1000),
                     queryString=query,
                 )
