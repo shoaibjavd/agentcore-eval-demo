@@ -84,9 +84,7 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
     Fetch OpenTelemetry spans AND log records from CloudWatch
     for the given session IDs.
 
-    The Evaluate API requires BOTH:
-    - OTel spans (from the aws/spans log group) with gen_ai attributes
-    - OTel log records (from the agent runtime log group) with conversation content
+    The Evaluate API requires OTel spans with gen_ai attributes.
     """
     logs_client = boto3.client("logs", region_name=region)
 
@@ -125,11 +123,14 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
             except logs_client.exceptions.ResourceNotFoundException:
                 print(f"  Log group {log_group} not found — skipping.")
                 continue
+            except Exception as e:
+                print(f"  Error querying {log_group}: {e}")
+                continue
 
             query_id = response["queryId"]
 
-            # Poll for results — CloudWatch queries are async, typically complete in 2-5 seconds
-            while True:
+            # Poll for results — CloudWatch queries are async
+            for _ in range(30):  # Up to 30 seconds
                 result = logs_client.get_query_results(queryId=query_id)
                 if result["status"] == "Complete":
                     break
@@ -154,14 +155,15 @@ def fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id=None):
 def run_evaluation(spans, evaluator_ids, region):
     """
     Run on-demand evaluation using the AgentCore Evaluate API.
-    Returns a dict of evaluator_id -> score.
+    Returns a dict of evaluator_id -> {score, explanation}.
     """
     client = boto3.client("bedrock-agentcore", region_name=region)
     results = {}
 
     for evaluator_id in evaluator_ids:
+        info = BUILTIN_EVALUATORS.get(evaluator_id, {})
         print(f"\nEvaluating with: {evaluator_id}")
-        print(f"  ({BUILTIN_EVALUATORS[evaluator_id]['description']})")
+        print(f"  ({info.get('description', 'Custom evaluator')})")
 
         try:
             response = client.evaluate(
@@ -171,14 +173,25 @@ def run_evaluation(spans, evaluator_ids, region):
 
             eval_results = response.get("evaluationResults", [])
             if eval_results:
-                score = eval_results[0].get("value", 0)
-                explanation = eval_results[0].get("explanation", "No explanation")
-                results[evaluator_id] = {
-                    "score": score,
-                    "explanation": explanation,
-                }
-                print(f"  Score: {score:.2f}")
-                print(f"  Explanation: {explanation[:150]}...")
+                # Each result has: evaluatorId, value (double), explanation, label, etc.
+                result = eval_results[0]
+                score = result.get("value", 0) or 0
+                explanation = result.get("explanation", "No explanation")
+                error_msg = result.get("errorMessage", "")
+
+                if error_msg:
+                    print(f"  Evaluator error: {error_msg}")
+                    results[evaluator_id] = {
+                        "score": 0,
+                        "explanation": error_msg,
+                    }
+                else:
+                    results[evaluator_id] = {
+                        "score": score,
+                        "explanation": explanation,
+                    }
+                    print(f"  Score: {score:.2f}")
+                    print(f"  Explanation: {explanation[:150]}...")
             else:
                 print(f"  No results returned.")
                 results[evaluator_id] = {"score": 0, "explanation": "No results"}
@@ -216,21 +229,35 @@ def enforce_quality_gate(results, threshold):
 
 def main():
     region = os.environ.get("AWS_REGION", "us-east-1")
-    session_ids = json.loads(os.environ.get("SESSION_IDS", "[]"))
+    session_ids_raw = os.environ.get("SESSION_IDS", "[]")
     threshold = float(os.environ.get("EVAL_THRESHOLD", "0.7"))
     evaluator_ids = os.environ.get(
         "EVALUATOR_IDS", ",".join(DEFAULT_CI_EVALUATORS)
     ).split(",")
     agent_runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
 
+    # Parse session IDs — handle both JSON array and comma-separated formats
+    try:
+        session_ids = json.loads(session_ids_raw)
+    except json.JSONDecodeError:
+        session_ids = [s.strip() for s in session_ids_raw.split(",") if s.strip()]
+
     if not session_ids:
         print("ERROR: No session IDs provided. Nothing to evaluate.")
+        # Write empty results so the PR comment step doesn't fail
+        with open("evaluation_results.json", "w") as f:
+            json.dump({"error": "No session IDs provided"}, f)
         sys.exit(1)
 
-    # Fetch traces (spans + log records from two CloudWatch log groups)
+    print(f"Session IDs to evaluate: {session_ids}")
+    print(f"Evaluators: {evaluator_ids}")
+
+    # Fetch traces (spans + log records from CloudWatch)
     spans = fetch_traces_from_cloudwatch(session_ids, region, agent_runtime_id)
     if not spans:
         print("ERROR: No traces found. Check CloudWatch Transaction Search.")
+        with open("evaluation_results.json", "w") as f:
+            json.dump({"error": "No traces found in CloudWatch"}, f)
         sys.exit(1)
 
     # Run evaluations

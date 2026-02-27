@@ -90,6 +90,7 @@ jobs:
         with:
           name: evaluation-results
           path: evaluation_results.json
+          if-no-files-found: ignore
 
       - name: Post evaluation summary to PR
         if: always()
@@ -100,24 +101,34 @@ jobs:
             let body = '## 🤖 AgentCore Evaluation Results\n\n';
 
             try {
-              const results = JSON.parse(fs.readFileSync('evaluation_results.json', 'utf8'));
-              const threshold = parseFloat('${{ env.EVAL_THRESHOLD }}');
+              if (!fs.existsSync('evaluation_results.json')) {
+                body += '⚠️ No evaluation results file was generated. Check the workflow logs for errors in earlier steps.';
+              } else {
+                const results = JSON.parse(fs.readFileSync('evaluation_results.json', 'utf8'));
+                const threshold = parseFloat('${{ env.EVAL_THRESHOLD }}');
 
-              body += '| Evaluator | Score | Status |\n';
-              body += '|-----------|-------|--------|\n';
+                // Handle error-only results (e.g. no sessions or no traces)
+                if (results.error) {
+                  body += `⚠️ Evaluation could not complete: ${results.error}`;
+                } else {
+                  body += '| Evaluator | Score | Status |\n';
+                  body += '|-----------|-------|--------|\n';
 
-              let allPassed = true;
-              for (const [evaluator, result] of Object.entries(results)) {
-                const passed = result.score >= threshold;
-                if (!passed) allPassed = false;
-                const status = passed ? '✅ Pass' : '❌ Fail';
-                body += `| ${evaluator} | ${result.score.toFixed(2)} | ${status} |\n`;
+                  let allPassed = true;
+                  for (const [evaluator, result] of Object.entries(results)) {
+                    const score = typeof result.score === 'number' ? result.score : 0;
+                    const passed = score >= threshold;
+                    if (!passed) allPassed = false;
+                    const status = passed ? '✅ Pass' : '❌ Fail';
+                    body += `| ${evaluator} | ${score.toFixed(2)} | ${status} |\n`;
+                  }
+
+                  body += `\n**Threshold:** ${threshold}\n`;
+                  body += allPassed
+                    ? '\n✅ **Quality gate passed.**'
+                    : '\n❌ **Quality gate failed.** Fix the issues above before merging.';
+                }
               }
-
-              body += `\n**Threshold:** ${threshold}\n`;
-              body += allPassed
-                ? '\n✅ **Quality gate passed.**'
-                : '\n❌ **Quality gate failed.** Fix the issues above before merging.';
             } catch (e) {
               body += '⚠️ Could not load evaluation results.\n\n' + e.message;
             }
