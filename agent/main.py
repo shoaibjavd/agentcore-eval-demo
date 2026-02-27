@@ -19,3 +19,4 @@ if __name__ == "__main__":
 # test eval pipeline trigger
 # iam fix
 # ecr fix
+# otel traces verification
