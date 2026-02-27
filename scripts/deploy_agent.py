@@ -93,6 +93,8 @@ def deploy_agent():
             control_client.update_agent_runtime(
                 agentRuntimeId=agent_runtime_id,
                 agentRuntimeArtifact=runtime_config["agentRuntimeArtifact"],
+                roleArn=runtime_role_arn,
+                networkConfiguration=runtime_config["networkConfiguration"],
             )
         else:
             print("ERROR: Runtime exists but could not find ARN. Exiting.")
