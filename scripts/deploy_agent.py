@@ -5,6 +5,7 @@ import sys
 import os
 import time
 
+
 def deploy_agent():
     region = os.environ["AWS_REGION"]
     account_id = os.environ["AWS_ACCOUNT_ID"]
@@ -60,9 +61,9 @@ def deploy_agent():
 
     if cognito_discovery_url:
         runtime_config["authorizerConfiguration"] = {
-            "customJWTAuthorizerConfiguration": {
+            "customJWTAuthorizer": {
                 "discoveryUrl": cognito_discovery_url,
-                "allowedAudiences": [cognito_audience] if cognito_audience else [],
+                "allowedAudience": [cognito_audience] if cognito_audience else [],
                 "allowedClients": [cognito_client_id] if cognito_client_id else [],
             }
         }
@@ -88,7 +89,7 @@ def deploy_agent():
         except Exception as e:
             print(f"Warning: Could not list runtimes: {e}")
 
-        if agent_runtime_arn:
+        if agent_runtime_arn and agent_runtime_id:
             print(f"Updating existing runtime: {agent_runtime_arn}")
             control_client.update_agent_runtime(
                 agentRuntimeId=agent_runtime_id,
@@ -97,23 +98,23 @@ def deploy_agent():
                 networkConfiguration=runtime_config["networkConfiguration"],
             )
         else:
-            print("ERROR: Runtime exists but could not find ARN. Exiting.")
+            print("ERROR: Runtime exists but could not find ARN/ID. Exiting.")
             sys.exit(1)
 
     print(f"Agent Runtime ARN: {agent_runtime_arn}")
 
-    # Wait for runtime to become active (no SDK waiter available)
-    print(f"Waiting for runtime to become ACTIVE (id={agent_runtime_id})...")
+    # Wait for runtime to become READY
+    print(f"Waiting for runtime to become READY (id={agent_runtime_id})...")
     for _ in range(60):  # Up to 5 minutes
         try:
             rt = control_client.get_agent_runtime(agentRuntimeId=agent_runtime_id)
             status = rt.get("status", "")
             print(f"  Status: {status}")
             if status == "READY":
-                print("Runtime is ACTIVE.")
+                print("Runtime is READY.")
                 break
             elif status in ("CREATE_FAILED", "UPDATE_FAILED"):
-                reason = rt.get("failureReason", "unknown")
+                reason = rt.get("statusReasons", [{}])
                 print(f"ERROR: Runtime failed with status {status}: {reason}")
                 sys.exit(1)
             time.sleep(5)
