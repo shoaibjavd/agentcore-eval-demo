@@ -27,7 +27,7 @@ def deploy_agent():
     )
 
     # Build and push
-    subprocess.run(["docker", "build", "-t", full_image_uri, "."], check=True)
+    subprocess.run(["docker", "build", "-t", full_image_uri, "agent/"], check=True)
     subprocess.run(["docker", "push", full_image_uri], check=True)
     print(f"Pushed image: {full_image_uri}")
 
