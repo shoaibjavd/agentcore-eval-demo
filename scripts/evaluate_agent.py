@@ -73,7 +73,6 @@ DEFAULT_CI_EVALUATORS = [
     "Builtin.Helpfulness",
     "Builtin.Correctness",
     "Builtin.GoalSuccessRate",
-    "Builtin.ToolSelectionAccuracy",
     "Builtin.InstructionFollowing",
     "Builtin.ResponseRelevance",
 ]
