@@ -59,17 +59,25 @@ def deploy_agent():
             }
         }
 
-    # Check if runtime already exists
+    # Check if runtime already exists by listing and filtering by name
+    agent_runtime_arn = None
     try:
-        existing = control_client.get_agent_runtime(agentRuntimeName=agent_name)
-        agent_runtime_arn = existing["agentRuntimeArn"]
-        print(f"Updating existing runtime: {agent_runtime_arn}")
+        runtimes = control_client.list_agent_runtimes()
+        for rt in runtimes.get("agentRuntimeSummaries", []):
+            if rt.get("agentRuntimeName") == agent_name:
+                agent_runtime_arn = rt["agentRuntimeArn"]
+                print(f"Found existing runtime: {agent_runtime_arn}")
+                break
+    except Exception as e:
+        print(f"Warning: Could not list runtimes: {e}")
 
+    if agent_runtime_arn:
+        print(f"Updating existing runtime: {agent_runtime_arn}")
         control_client.update_agent_runtime(
             agentRuntimeArn=agent_runtime_arn,
             agentRuntimeArtifact=runtime_config["agentRuntimeArtifact"],
         )
-    except control_client.exceptions.ResourceNotFoundException:
+    else:
         print(f"Creating new runtime: {agent_name}")
         response = control_client.create_agent_runtime(**runtime_config)
         agent_runtime_arn = response["agentRuntimeArn"]
